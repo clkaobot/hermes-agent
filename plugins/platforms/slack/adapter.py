@@ -11,6 +11,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
 import aiohttp
@@ -43,8 +44,10 @@ from gateway.platforms.base import (
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
+    from .api_transport import keyless_api_base_url, has_keyless_credentials
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from api_transport import keyless_api_base_url, has_keyless_credentials  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -652,7 +655,9 @@ def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
         client.proxy = proxy_url
 
 
-def _slack_per_request_proxy_middleware(proxy_url: Optional[str]) -> Callable[..., Awaitable[Any]]:
+def _slack_per_request_proxy_middleware(
+    proxy_url: Optional[str], api_base_url: Optional[str] = None
+) -> Callable[..., Awaitable[Any]]:
     """Bolt ``before_authorize`` middleware re-applying *proxy_url* per request: Bolt builds a fresh
     ``AsyncWebClient`` per request and ``slack_sdk`` treats ``proxy=None`` as "unspecified" (reloads
     ``HTTP(S)_PROXY``, bypassing NO_PROXY), so "go direct" only survives if re-set
@@ -660,6 +665,8 @@ def _slack_per_request_proxy_middleware(proxy_url: Optional[str]) -> Callable[..
 
     async def pin_per_request_proxy(client: Any, next_: Callable[[], Awaitable[Any]]) -> Any:
         _apply_slack_proxy(client, proxy_url)
+        if api_base_url:
+            client.base_url = api_base_url
         return await next_()
 
     return pin_per_request_proxy
@@ -699,7 +706,7 @@ async def _cancel_socket_tasks(tasks: Any) -> None:
 _SLACK_PROXY_HOSTS = ("slack.com", "files.slack.com", "wss-primary.slack.com")
 
 
-def _resolve_slack_proxy_url() -> Optional[str]:
+def _resolve_slack_proxy_url(api_base_url: Optional[str] = None) -> Optional[str]:
     """Resolve a proxy URL that Slack SDK clients can safely use."""
     proxy_url = resolve_proxy_url()
     if not proxy_url:
@@ -710,7 +717,8 @@ def _resolve_slack_proxy_url() -> Optional[str]:
             "[Slack] Ignoring unsupported proxy scheme for Slack transport: %s",
             safe_url_for_log(proxy_url))
         return None
-    if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
+    hosts = (urlsplit(api_base_url).hostname,) if api_base_url else _SLACK_PROXY_HOSTS
+    if any(is_host_excluded_by_no_proxy(host) for host in hosts):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
         return None
     return proxy_url
@@ -1572,9 +1580,11 @@ class SlackAdapter(BasePlatformAdapter):
         if _plugin_handlers:
             logger.info("[Slack] Wired %d plugin action handler(s)", len(_plugin_handlers))
 
-    @staticmethod
-    def _new_web_client(token: str, proxy_url: Optional[str]) -> Any:
-        client = AsyncWebClient(token=token, user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX)
+    def _new_web_client(self, token: str, proxy_url: Optional[str]) -> Any:
+        api_base_url = getattr(self, "_api_base_url", None)
+        kwargs = {"base_url": api_base_url} if api_base_url else {}
+        client = AsyncWebClient(
+            token=token, user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX, **kwargs)
         _apply_slack_proxy(client, proxy_url)
         return client
 
@@ -1606,7 +1616,13 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] slack-bolt not installed. Run: pip install slack-bolt")
             self._set_fatal_error("missing_dependency", "slack-bolt not installed", retryable=False)
             return False
-        raw_token = self.config.token
+        try:
+            api_base_url = keyless_api_base_url(self.config.extra)
+        except ValueError as exc:
+            self._set_fatal_error("invalid_api_base_url", str(exc), retryable=False)
+            logger.error("[Slack] %s", exc)
+            return False
+        raw_token = "xoxb-keyless" if api_base_url else self.config.token
         # Scoped secret is authoritative; only an UNSCOPED read falls back to
         # process env, else a secondary profile inherits the default's app.
         try:
@@ -1615,7 +1631,7 @@ class SlackAdapter(BasePlatformAdapter):
             # or a secondary profile missing SLACK_APP_TOKEN silently inherits the default profile's Socket
             # Mode app (#59739). Only an UNSCOPED read under multiplex (default-profile startup loop,
             # background reconnect rebuild) falls back to process env, which is that profile's own.
-            app_token = get_secret("SLACK_APP_TOKEN")
+            app_token = "xapp-keyless" if api_base_url else get_secret("SLACK_APP_TOKEN")
         except UnscopedSecretError:
             app_token = os.getenv("SLACK_APP_TOKEN")
         for env_name, value in (("SLACK_BOT_TOKEN", raw_token), ("SLACK_APP_TOKEN", app_token)):
@@ -1625,10 +1641,15 @@ class SlackAdapter(BasePlatformAdapter):
         proxy_url = _resolve_slack_proxy_url()
         if proxy_url:
             logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
-        bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
+        # An edge endpoint owns one identity; never forward local OAuth tokens there.
+        bot_tokens = [raw_token] if api_base_url else _load_slack_bot_tokens(raw_token, quiet=False)
+        api_proxy_url = _resolve_slack_proxy_url(api_base_url) if api_base_url else proxy_url
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock("slack-app-token", app_token, "Slack app token"):
+            lock_scope = "slack-keyless-endpoint" if api_base_url else "slack-app-token"
+            resource_desc = "Slack keyless endpoint" if api_base_url else "Slack app token"
+            if not self._acquire_platform_lock(
+                    lock_scope, api_base_url or app_token, resource_desc):
                 return False
             lock_acquired = True
             self._running = False
@@ -1646,15 +1667,16 @@ class SlackAdapter(BasePlatformAdapter):
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
+            self._api_base_url = api_base_url
             # Reset so a reconnect with dropped/rotated tokens carries no stale identities.
             self._bot_user_id = self._bot_display_name = None
             self._team_clients, self._team_bot_user_ids, self._team_bot_names = {}, {}, {}
             self._app = AsyncApp(
-                token=bot_tokens[0], client=self._new_web_client(bot_tokens[0], proxy_url),
-                before_authorize=_slack_per_request_proxy_middleware(proxy_url))
-            _apply_slack_proxy(self._app.client, proxy_url)
+                token=bot_tokens[0], client=self._new_web_client(bot_tokens[0], api_proxy_url),
+                before_authorize=_slack_per_request_proxy_middleware(api_proxy_url, api_base_url))
+            _apply_slack_proxy(self._app.client, api_proxy_url)
             for token in bot_tokens:
-                await self._authenticate_workspace(token, proxy_url)
+                await self._authenticate_workspace(token, api_proxy_url)
             self._register_bolt_handlers()
             # _running=True only once the handler is alive (watchdog needs the live
             # task); on failure keep it False so ``finally`` releases the lock.
@@ -6031,7 +6053,7 @@ class SlackAdapter(BasePlatformAdapter):
 # _apply_yaml_config, _is_connected, _build_adapter) ──────────────────────────
 
 
-# Standalone-send cache: user ID -> DM conversation ID, keyed "{token}:{user_id}" (multi-workspace).
+# Standalone-send DM cache is scoped by token/user and, for keyless credentials, API endpoint.
 # ────────────────────────────────────────────────────────────────────────── Plugin migration glue (#41112 /
 # #3823) Everything below this line was added when the Slack adapter moved from
 # ``gateway/platforms/slack.py`` into this bundled plugin. It mirrors the Discord migration (PR #24356)
@@ -6092,24 +6114,30 @@ def _load_slack_bot_tokens(raw_token: str, *, quiet: bool) -> List[str]:
     return tokens
 
 
-def _standalone_proxy_kwargs() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _standalone_proxy_kwargs(api_base_url: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``(session_kwargs, request_kwargs)`` for aiohttp honoring the configured proxy."""
     from gateway.platforms.base import proxy_kwargs_for_aiohttp
-    return proxy_kwargs_for_aiohttp(resolve_proxy_url())
+    proxy_url = _resolve_slack_proxy_url(api_base_url) if api_base_url else resolve_proxy_url()
+    return proxy_kwargs_for_aiohttp(proxy_url)
 
 
-async def _slack_json_post(session, token: str, method: str, payload: dict, req_kw: dict) -> dict:
-    """POST ``payload`` to ``https://slack.com/api/<method>`` with a bearer token; JSON body."""
+async def _slack_json_post(
+    session, token: str, method: str, payload: dict, req_kw: dict, *,
+    api_base_url: Optional[str] = None) -> dict:
+    """POST JSON to the configured Slack API endpoint with a bearer token."""
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     async with session.post(
-        f"https://slack.com/api/{method}", headers=headers, json=payload, **req_kw) as resp:
+        f"{api_base_url or 'https://slack.com/api/'}{method}", headers=headers, json=payload, **req_kw) as resp:
         return await resp.json()
 
 
-async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
+async def _resolve_slack_user_dm(
+    token: str, user_id: str, *, api_base_url: Optional[str] = None) -> Optional[str]:
     """Resolve a user ID (U.../W...) to a DM conversation ID (D...) via ``conversations.open``;
-    cached per (token, user). None on failure (e.g. missing ``im:write``)."""
+    cached per (endpoint, token, user). None on failure (e.g. missing ``im:write``)."""
     cache_key = f"{token}:{user_id}"
+    if api_base_url:
+        cache_key = f"{api_base_url}:{cache_key}"
     if cache_key in _slack_dm_cache:
         return _slack_dm_cache[cache_key]
     try:
@@ -6117,11 +6145,12 @@ async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
     except ImportError:
         return None
     try:
-        _sess_kw, _req_kw = _standalone_proxy_kwargs()
+        _sess_kw, _req_kw = _standalone_proxy_kwargs(api_base_url)
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as session:
             data = await _slack_json_post(
-                session, token, "conversations.open", {"users": user_id}, _req_kw)
+                session, token, "conversations.open", {"users": user_id}, _req_kw,
+                api_base_url=api_base_url)
             if data.get("ok") and data.get("channel", {}).get("id"):
                 channel_id = data["channel"]["id"]
                 _slack_dm_cache[cache_key] = channel_id
@@ -6186,7 +6215,8 @@ async def _standalone_upload_file(
 
 async def _standalone_send_media(
     token: str, chat_id: str, media_files: list, thread_id: Optional[str], formatted: Optional[str],
-    formatted_caption: Optional[str], unfurl_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    formatted_caption: Optional[str], unfurl_kwargs: Dict[str, Any], *,
+    api_base_url: Optional[str] = None) -> Dict[str, Any]:
     """Media branch of ``_standalone_send``: ``files_upload_v2`` per file (+ optional text post).
     ``caption`` rides as ``initial_comment`` on the first successful upload unless
     link-preview controls are explicit (the upload API cannot carry them)."""
@@ -6198,8 +6228,9 @@ async def _standalone_send_media(
         return {
             'error': "slack_sdk not installed. Run: pip install 'slack-sdk' (required for Slack MEDIA delivery via send_message)",
         }
-    client = _AsyncWebClient(token=token)
-    _apply_slack_proxy(client, resolve_proxy_url())
+    client = _AsyncWebClient(token=token, **({"base_url": api_base_url} if api_base_url else {}))
+    proxy_url = _resolve_slack_proxy_url(api_base_url) if api_base_url else resolve_proxy_url()
+    _apply_slack_proxy(client, proxy_url)
     last_message_id = None
     # The upload API cannot carry unfurl controls; explicit ones need a separate caption post.
     caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
@@ -6276,9 +6307,15 @@ async def _standalone_send(
     del force_document  # signature parity with other standalone senders
     media_files = media_files or []
     # Under multiplex os.environ may hold ANOTHER profile's token: read via the secret scope.
-    raw_token = getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", "")
+    try:
+        api_base_url = keyless_api_base_url(pconfig.extra or {})
+    except ValueError as exc:
+        return {"error": str(exc)}
+    endpoint_kwargs = {"api_base_url": api_base_url} if api_base_url else {}
+    raw_token = "xoxb-keyless" if api_base_url else (
+        getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", ""))
     # Comma-separated multi-workspace list plus slack_tokens.json; no team map, so try each.
-    tokens = _load_slack_bot_tokens(str(raw_token or ""), quiet=True)
+    tokens = [raw_token] if api_base_url else _load_slack_bot_tokens(str(raw_token or ""), quiet=True)
     if not tokens:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
     token = tokens[0]
@@ -6290,7 +6327,7 @@ async def _standalone_send(
     if chat_id[:1] in ("U", "W"):
         resolved = None
         for _tok in tokens:
-            resolved = await _resolve_slack_user_dm(_tok, chat_id)
+            resolved = await _resolve_slack_user_dm(_tok, chat_id, **endpoint_kwargs)
             if resolved is not None:
                 token = _tok
                 break
@@ -6305,7 +6342,8 @@ async def _standalone_send(
     unfurl_kwargs = _slack_unfurl_kwargs(getattr(pconfig, "extra", None))
     if media_files:
         return await _standalone_send_media(
-            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs)
+            token, chat_id, media_files, thread_id, formatted, formatted_caption, unfurl_kwargs,
+            **endpoint_kwargs)
     # --- Text-only path (existing aiohttp chat.postMessage) ---
     if not formatted or not formatted.strip():
         logger.debug("[Slack] _standalone_send: skipping empty/whitespace message")
@@ -6315,13 +6353,14 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        _sess_kw, _req_kw = _standalone_proxy_kwargs()
+        _sess_kw, _req_kw = _standalone_proxy_kwargs(api_base_url)
         last_error = "unknown"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             payload = _standalone_post_kwargs(chat_id, formatted, unfurl_kwargs, thread_id)
             for tok in tokens:
-                data = await _slack_json_post(session, tok, "chat.postMessage", payload, _req_kw)
+                data = await _slack_json_post(
+                    session, tok, "chat.postMessage", payload, _req_kw, **endpoint_kwargs)
                 if data.get("ok"):
                     return {
                         "success": True, "platform": "slack", "chat_id": chat_id,
@@ -6467,10 +6506,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Connected when SLACK_BOT_TOKEN is set. Resolved through ``gateway_mod`` at call
-    time (not a bound import) so tests patching ``get_env_value`` take effect."""
+    """Configured with a keyless endpoint or SLACK_BOT_TOKEN. Token lookup stays resolved
+    through ``gateway_mod`` at call time so existing setup/status callers retain their behavior."""
     import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
+    return has_keyless_credentials(config) or bool(
+        (gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
 
 
 def _build_adapter(config):
@@ -6487,6 +6527,7 @@ def register(ctx) -> None:
         check_fn=slack_deps_present,
         ensure_deps_fn=check_slack_requirements,
         is_connected=_is_connected,
+        has_credentials=has_keyless_credentials,
         required_env=["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
         install_hint="Run `hermes setup` to install Slack support.",
         setup_fn=interactive_setup,
