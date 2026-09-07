@@ -642,6 +642,43 @@ Without a custom `base_url` nothing changes: inbound file URLs are accepted only
 on Slack's own CDN hosts (`slack.com`, `slack-files.com` and their subdomains)
 over `https`.
 
+#### Keyless edges and private files
+
+A credential-injecting edge can hold both Slack tokens outside Hermes. Configure
+its Web API endpoint under `platforms.slack.extra.keyless_api_base_url`; Hermes
+uses placeholder tokens instead of local bot/app credentials.
+
+Private attachments need a **separate, explicitly implemented file route**:
+
+```yaml
+platforms:
+  slack:
+    extra:
+      keyless_api_base_url: "https://edge.example/api/"
+      # Optional: set only when your edge implements the contract below.
+      keyless_file_base_url: "https://edge.example/private/"
+```
+
+For example, `https://files.slack.com/files-pri/T123-F456/report.pdf?download=1`
+is requested as `https://edge.example/private/files-pri/T123-F456/report.pdf?download=1`
+with the synthetic `Bearer xoxb-keyless`. The edge must authenticate callers,
+use a **fixed `https://files.slack.com` backend**, inject its workspace bot token
+(with [`files:read` and access to the file](https://docs.slack.dev/reference/objects/file-object/)),
+and return file bytes directly.
+Do not use caller-controlled hosts or query parameters to select another backend.
+Hermes rejects every redirect on this route, including redirects back to Slack;
+any necessary upstream redirect handling belongs to the edge with its own
+Slack-host and credential-forwarding checks.
+
+Only HTTPS `files.slack.com/files-pri/T…-F…/…` source URLs are mapped. Userinfo,
+nondefault source ports, dot traversal, encoded separators and nested escaping
+are rejected; ordinary path/query encoding is preserved. Without a file route,
+attachments produce a configuration notice without contacting the CDN.
+This option does not create an edge route: [exe.dev's documented Slack integration](https://exe.dev/docs/integrations-slack-bot.md)
+covers `/api/<method>` Web API forwarding, **not private-file downloads**. Do not
+infer a file endpoint from that API URL. Token-backed profiles keep their existing
+download routing and SSRF guards.
+
 #### Routing Slack through a proxy
 
 Hermes honors the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` environment
