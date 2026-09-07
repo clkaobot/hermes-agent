@@ -1351,6 +1351,9 @@ platform_toolsets:
 #           - my-important-skill
 #   slack:
 #     extra:
+#       # Edge-held Slack tokens; private files require a separately implemented route.
+#       # keyless_api_base_url: "https://edge.example/api/"
+#       # keyless_file_base_url: "https://edge.example/private/"
 #       # Render live tool calls as Slack-native plan/task cards. This explicit
 #       # opt-in works even though Slack text tool_progress defaults to off.
 #       native_task_cards: false
